@@ -4,6 +4,8 @@ using UnityEditor;
 
 public class LogManager_Exercise_GPU_Instancing : MonoBehaviour
 {
+#if UNITY_EDITOR
+
     [field: SerializeField] public GPUInstancingBenchmark instancingBenchmark; 
 
     private void OnValidate()
@@ -37,6 +39,7 @@ public class LogManager_Exercise_GPU_Instancing : MonoBehaviour
 
         string renderingMode = instancingBenchmark.useGPUInstancing ? "instanced" : "non-instanced";
 
+
         int numTris = UnityStats.triangles;
         int drawCalls = UnityStats.drawCalls;
         int objectCount = instancingBenchmark._instanceCount;
@@ -48,8 +51,8 @@ public class LogManager_Exercise_GPU_Instancing : MonoBehaviour
     }
 
 
-    
 
+#endif
 
 
 }

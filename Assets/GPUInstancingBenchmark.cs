@@ -1,52 +1,34 @@
-﻿using UnityEngine;
+﻿using System;
+using UnityEditor;
+using UnityEngine;
 using UnityEngine.Rendering;
 
-/// <summary>
-/// GPU Instancing Benchmark — Unity URP
-///
-/// ROOT CAUSE OF THE ORIGINAL BUG:
-///   Unity auto-instances DrawMesh calls that share the same Material when
-///   Material.enableInstancing == true, regardless of which Draw API you use.
-///   The ONLY reliable way to prevent instancing is to set
-///   Material.enableInstancing = false on the material passed to the draw call.
-///   This script keeps TWO runtime material instances (never touching your asset):
-///     _matInstanced  — enableInstancing forced TRUE
-///     _matBaseline   — enableInstancing forced FALSE  (SRP Batcher path in URP)
-///
-/// SETUP:
-///   1. Attach to an empty GameObject.
-///   2. Assign any Mesh (e.g. extract sharedMesh from a cube).
-///   3. Assign a URP/Lit Material (the original asset is never modified).
-///   4. Press Play.
-///
-/// CONTROLS:
-///   ↑ / ↓   — grow / shrink grid  (x × x)
-///   I        — toggle GPU Instancing ON ↔ OFF
-///   R        — force rebuild
-///
-/// RENDER PATHS:
-///   ON  → Graphics.DrawMeshInstanced in 1023-instance batches.
-///          Keyword INSTANCING_ON will be active. One instanced draw call per batch.
-///   OFF → Graphics.DrawMesh per object, material.enableInstancing = false.
-///          Prevents all auto-instancing. URP SRP Batcher handles merging instead.
-///          No INSTANCING_ON keyword visible in Frame Debugger.
-///
-/// PERFORMANCE NOTES:
-///   • Zero GameObjects — no Transform / Renderer overhead.
-///   • Matrix array pre-allocated, only grown never shrunk.
-///   • Scratch buffer for overflow batches > 1023, allocated once.
-///   • Zero GC allocs per frame after first RebuildGrid().
-/// </summary>
+
+public enum EMaterialMode
+{
+    Single = 0, 
+    Single_Expensive =1,
+    Ten =2,
+    Unique=3
+    
+}
+
+
 [AddComponentMenu("Benchmarks/GPU Instancing Benchmark")]
 public class GPUInstancingBenchmark : MonoBehaviour
 {
     // ── Inspector ─────────────────────────────────────────────────────────────
     [Header("Mesh & Material")]
     [Tooltip("Any mesh. Tip: create a default cube, copy its MeshFilter.sharedMesh here, then delete the cube.")]
-    public Mesh mesh;
+    public Mesh meshRef;
+
+    private Mesh _mesh;
 
     [Tooltip("Source URP material. A runtime copy is made — your asset is never modified.")]
     public Material sourceMaterial;
+
+    public Material matExpensive;
+
 
     [Header("Grid")]
     [Range(1, 250)]
@@ -54,12 +36,24 @@ public class GPUInstancingBenchmark : MonoBehaviour
     public float spacing = 1.5f;
 
     [Header("Mode")]
+
+    public EMaterialMode materialMode = EMaterialMode.Single;
+
+    private Material[] _materials10;
+    private Material[] _perObjectMaterials;
+
+
     [Tooltip("Toggled at runtime with the I key.")]
     public bool useGPUInstancing = true;
+
+
+    public bool useFrustumCulling = true;
+
 
     [Header("Controls")]
     public KeyCode increaseKey = KeyCode.UpArrow;
     public KeyCode decreaseKey = KeyCode.DownArrow;
+    public KeyCode toggleMatKey = KeyCode.RightArrow;
     public KeyCode toggleInstancingKey = KeyCode.I;
     public KeyCode rebuildKey = KeyCode.R;
     public int minGridSize = 1;
@@ -71,24 +65,39 @@ public class GPUInstancingBenchmark : MonoBehaviour
     // Two runtime material copies — the source asset is never touched.
     private Material _matInstanced;  // enableInstancing = true
     private Material _matBaseline;   // enableInstancing = false  ← prevents auto-instancing
+    private Material _matExpensive;
 
     private Matrix4x4[] _matrices;
     private Matrix4x4[] _scratch;    // reused overflow buffer for batches after the first
     public int _instanceCount { get; private set; }
     private const int _submeshIndex = 0;
-    private Camera _mainCam;
+    [SerializeField] private Camera _mainCam;
 
     // Shared MPB avoids per-draw heap allocations.
     private MaterialPropertyBlock _mpb;
 
     // ── GUI ───────────────────────────────────────────────────────────────────
     private GUIStyle _labelStyle;
-    private readonly Rect _guiRect = new Rect(10, 10, 430, 120);
+    private readonly Rect _guiRect = new Rect(10, 10, 430, 200);
 
     // ─────────────────────────────────────────────────────────────────────────
     void Awake()
     {
-        _mainCam = Camera.main;
+        _mesh = Instantiate(meshRef);
+
+        if (!useFrustumCulling) _mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1e18f);
+
+        // test. This renders fine.
+        //        _mesh = new Mesh();
+        //        _mesh.vertices = new Vector3[] {
+        //    new(-0.5f,0,-0.5f), new(0.5f,0,-0.5f),
+        //    new(0.5f,0,0.5f),   new(-0.5f,0,0.5f)
+        //};
+        //        _mesh.triangles = new int[] { 0, 2, 1, 0, 3, 2 };
+        //        _mesh.RecalculateNormals();
+        //        _mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1e18f);
+
+
         _mpb = new MaterialPropertyBlock();
 
         if (sourceMaterial == null)
@@ -100,24 +109,146 @@ public class GPUInstancingBenchmark : MonoBehaviour
 
         // Create two independent runtime copies so the original asset is never dirtied.
         _matInstanced = new Material(sourceMaterial) { name = sourceMaterial.name + "_INSTANCED" };
+        Debug.Log(_matInstanced.shader.name);
         _matBaseline = new Material(sourceMaterial) { name = sourceMaterial.name + "_BASELINE" };
+        Debug.Log(_matBaseline.shader.name);
+
+        _matExpensive = new Material(matExpensive) { name = sourceMaterial.name + "_EXPENSIVE" };
+
 
         // Hard-lock each copy into its instancing state for the lifetime of this session.
         _matInstanced.enableInstancing = true;
         _matBaseline.enableInstancing = false; // this is the actual fix
+        _matExpensive.enableInstancing = false;
+
+
+        GenerateMaterials();
 
         RebuildGrid();
+    }
+
+    private void GenerateMaterials()
+    {
+        // -----------------------------
+        // 10 SHARED MATERIALS (still slightly batchable within group)
+        // -----------------------------
+        _materials10 = new Material[10];
+
+        for (int i = 0; i < 10; i++)
+        {
+            var mat = new Material(sourceMaterial)
+            {
+                name = sourceMaterial.name + $"_VAR_{i}"
+            };
+
+            // still useful visual differentiation
+            mat.color = Color.HSVToRGB(i / 10f, 0.8f, 1f);
+
+            // small keyword variation helps break SRP batching further
+            if (i % 2 == 0)
+                mat.EnableKeyword("VARIANT_A");
+            else
+                mat.EnableKeyword("VARIANT_B");
+
+            // UNIQUE procedural texture per material (this is the big breaker)
+            Texture2D tex = GenerateNoiseTexture(32, 32, i * 1337);
+            mat.mainTexture = tex;
+
+            _materials10[i] = mat;
+        }
+
+        // -----------------------------
+        // PER OBJECT MATERIALS (FULL STRESS TEST)
+        // -----------------------------
+        _perObjectMaterials = new Material[_instanceCount];
+
+        for (int i = 0; i < _instanceCount; i++)
+        {
+            var mat = new Material(sourceMaterial)
+            {
+                name = sourceMaterial.name + $"_OBJ_{i}"
+            };
+
+            mat.color = Color.HSVToRGB((i * 0.618033f) % 1f, 0.95f, 1f);
+
+            // 🔥 unique GPU texture per object (this kills batching hard)
+            Texture2D tex = GenerateNoiseTexture(16, 16, i * 9781);
+            mat.mainTexture = tex;
+
+            // optional extra entropy: shader keyword toggles
+            if ((i & 1) == 0)
+                mat.EnableKeyword("UNI_A");
+            else
+                mat.EnableKeyword("UNI_B");
+
+            _perObjectMaterials[i] = mat;
+        }
+    }
+
+    private Texture2D GenerateNoiseTexture(int width, int height, int seed)
+    {
+        var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        tex.wrapMode = TextureWrapMode.Repeat;
+        tex.filterMode = FilterMode.Point;
+
+        System.Random rng = new System.Random(seed);
+
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                float v = (float)rng.NextDouble();
+
+                Color c = new Color(
+                    v,
+                    (float)rng.NextDouble(),
+                    (float)rng.NextDouble(),
+                    1f
+                );
+
+                tex.SetPixel(x, y, c);
+            }
+        }
+
+        tex.Apply(false, false);
+        return tex;
+    }
+
+    private void Start()
+    {
+        if (!_mainCam)
+            _mainCam = Camera.main;
+
+        // Fallback: find ANY camera in the scene
+        if (_mainCam == null)
+            _mainCam = FindFirstObjectByType<Camera>();
+
+        if (_mainCam == null)
+            throw new Exception("No camera found in scene!");
+
+        Debug.Log($"[Benchmark] Using camera: {_mainCam.name}, tag: {_mainCam.tag}");
+
     }
 
     void OnDestroy()
     {
         if (_matInstanced) Destroy(_matInstanced);
         if (_matBaseline) Destroy(_matBaseline);
+        if (_mesh) Destroy(_mesh);
+
+        if (_materials10 != null)
+            foreach (var m in _materials10)
+                Destroy(m);
+
+        if (_perObjectMaterials != null)
+            foreach (var m in _perObjectMaterials)
+                Destroy(m);
     }
 
     // ── Update ────────────────────────────────────────────────────────────────
     void Update()
     {
+        UpdateVisibilityStats();
         HandleInput();
         Render();
     }
@@ -135,6 +266,11 @@ public class GPUInstancingBenchmark : MonoBehaviour
         if (Input.GetKeyDown(decreaseKey))
         {
             gridSize = Mathf.Max(gridSize - 1, minGridSize);
+            rebuild = true;
+        }
+        if (Input.GetKeyDown(toggleMatKey))
+        {
+            materialMode = (EMaterialMode)(((int)materialMode + 1) % 4);
             rebuild = true;
         }
         if (Input.GetKeyDown(toggleInstancingKey))
@@ -170,12 +306,17 @@ public class GPUInstancingBenchmark : MonoBehaviour
                     Quaternion.identity,
                     Vector3.one);
             }
+
+        if (materialMode == EMaterialMode.Unique)
+        {
+            GenerateMaterials();
+        }
     }
 
     // ── Rendering (zero GC per frame) ─────────────────────────────────────────
     void Render()
     {
-        if (mesh == null) return;
+        if (_mesh == null) return;
 
         if (useGPUInstancing)
             RenderInstanced();
@@ -212,7 +353,7 @@ public class GPUInstancingBenchmark : MonoBehaviour
             }
 
             Graphics.DrawMeshInstanced(
-                mesh,
+                _mesh,
                 _submeshIndex,
                 _matInstanced,
                 src,
@@ -221,7 +362,7 @@ public class GPUInstancingBenchmark : MonoBehaviour
                 ShadowCastingMode.On,
                 receiveShadows: true,
                 layer: gameObject.layer,
-                camera: _mainCam);
+                camera: null);
 
             offset += count;
             remaining -= count;
@@ -236,21 +377,120 @@ public class GPUInstancingBenchmark : MonoBehaviour
     {
         for (int i = 0; i < _instanceCount; i++)
         {
+            Material mat = _matBaseline;
+
+            switch (materialMode)
+            {
+                case EMaterialMode.Single:
+                    mat = _matBaseline;
+                    break;
+
+                case EMaterialMode.Single_Expensive:
+                    mat = _matExpensive;
+                    break;
+
+                case EMaterialMode.Ten:
+                    int idx10 = i % 10;
+                    mat = _materials10[idx10];
+                    break;
+
+                case EMaterialMode.Unique:
+                    mat = _perObjectMaterials[i];
+                    break;
+            }
+
             Graphics.DrawMesh(
-                mesh,
+                _mesh,
                 _matrices[i],
-                _matBaseline,
+                mat,
                 gameObject.layer,
-                _mainCam,
+                null,
                 _submeshIndex,
                 _mpb,
                 true,
                 receiveShadows: true,
                 useLightProbes: true);
         }
+
     }
 
-    // ── HUD ───────────────────────────────────────────────────────────────────
+
+    public int _visibleCount { get; private set; }
+    public int _culledCount { get; private set; }
+
+
+    //    // ── HUD ───────────────────────────────────────────────────────────────────
+    //    void OnGUI()
+    //    {
+    //        if (_labelStyle == null)
+    //        {
+    //            _labelStyle = new GUIStyle(GUI.skin.label)
+    //            {
+    //                fontSize = 14,
+    //                fontStyle = FontStyle.Bold,
+    //                richText = true
+    //            };
+    //        }
+
+    //        GUI.Box(_guiRect, GUIContent.none);
+    //        GUILayout.BeginArea(new Rect(_guiRect.x + 8, _guiRect.y + 8,
+    //                                     _guiRect.width - 16, _guiRect.height - 16));
+
+    //        string modeLabel = useGPUInstancing
+    //            ? "<color=#00ff88>GPU INSTANCING  ON   (DrawMeshInstanced)</color>"
+    //            : "<color=#ff6644>GPU INSTANCING  OFF  (SRP Batcher baseline)</color>";
+
+    //        GUILayout.Label(modeLabel, _labelStyle);
+    //        GUILayout.Label($"Grid  {gridSize} × {gridSize}  =  {_instanceCount:N0} objects", _labelStyle);
+    //        GUILayout.Label($"FPS   {1f / Time.smoothDeltaTime:F1}   |   " +
+    //                        $"ms  {Time.smoothDeltaTime * 1000f:F2}", _labelStyle);
+    //        GUILayout.Space(2);
+    //        GUILayout.Label(
+    //            $"[{increaseKey}/{decreaseKey}] resize    [{toggleInstancingKey}] toggle    [{rebuildKey}] rebuild",
+    //            _labelStyle);
+
+    //        GUILayout.EndArea();
+    //    }
+
+    //    // ── Editor gizmo ──────────────────────────────────────────────────────────
+    //#if UNITY_EDITOR
+    //    void OnDrawGizmosSelected()
+    //    {
+    //        if (!Application.isPlaying) return;
+    //        Gizmos.color = new Color(0f, 1f, 0.5f, 0.12f);
+    //        float size = gridSize * spacing;
+    //        Gizmos.DrawWireCube(transform.position, new Vector3(size, 0.02f, size));
+    //    }
+    //#endif
+
+
+    private readonly Plane[] _frustumPlanes = new Plane[6];
+
+
+    void UpdateVisibilityStats()
+    {
+        if (_mainCam == null || _matrices == null) return;
+
+        GeometryUtility.CalculateFrustumPlanes(_mainCam, _frustumPlanes);
+
+        int visible = 0;
+
+        for (int i = 0; i < _instanceCount; i++)
+        {
+            // Extract position from matrix
+            Vector3 pos = _matrices[i].GetColumn(3);
+
+            // Approximate bounds (adjust to your mesh size if needed)
+            Bounds bounds = new Bounds(pos, Vector3.one);
+
+            if (GeometryUtility.TestPlanesAABB(_frustumPlanes, bounds))
+                visible++;
+        }
+
+        _visibleCount = useFrustumCulling ? visible : _instanceCount;    
+        _culledCount = useFrustumCulling ? (_instanceCount - visible) : 0;
+    }
+
     void OnGUI()
     {
         if (_labelStyle == null)
@@ -264,18 +504,40 @@ public class GPUInstancingBenchmark : MonoBehaviour
         }
 
         GUI.Box(_guiRect, GUIContent.none);
-        GUILayout.BeginArea(new Rect(_guiRect.x + 8, _guiRect.y + 8,
-                                     _guiRect.width - 16, _guiRect.height - 16));
+
+        GUILayout.BeginArea(new Rect(
+            _guiRect.x + 8,
+            _guiRect.y + 8,
+            _guiRect.width - 16,
+            _guiRect.height - 16));
 
         string modeLabel = useGPUInstancing
             ? "<color=#00ff88>GPU INSTANCING  ON   (DrawMeshInstanced)</color>"
             : "<color=#ff6644>GPU INSTANCING  OFF  (SRP Batcher baseline)</color>";
 
         GUILayout.Label(modeLabel, _labelStyle);
-        GUILayout.Label($"Grid  {gridSize} × {gridSize}  =  {_instanceCount:N0} objects", _labelStyle);
-        GUILayout.Label($"FPS   {1f / Time.smoothDeltaTime:F1}   |   " +
-                        $"ms  {Time.smoothDeltaTime * 1000f:F2}", _labelStyle);
+
+        string modeLabel2 = useFrustumCulling
+            ? "<color=#00ff88>FRUSTUM CULLING  ON</color>"
+            : "<color=#ff6644>FRUSTUM CULLING OFF  (SRP Batcher baseline)</color>";
+
+        GUILayout.Label(modeLabel2, _labelStyle);
+
+
+        GUILayout.Label(
+            $"Grid  {gridSize} × {gridSize}  =  {_instanceCount:N0} objects",
+            _labelStyle);
+
+        GUILayout.Label(
+            $"Visible  {(useFrustumCulling ? _visibleCount : _instanceCount):N0}   |   Culled  {(useFrustumCulling ? _culledCount : 0):N0}",
+            _labelStyle);
+
+        GUILayout.Label(
+            $"FPS   {1f / Time.smoothDeltaTime:F1}   |   ms  {Time.smoothDeltaTime * 1000f:F2}",
+            _labelStyle);
+
         GUILayout.Space(2);
+
         GUILayout.Label(
             $"[{increaseKey}/{decreaseKey}] resize    [{toggleInstancingKey}] toggle    [{rebuildKey}] rebuild",
             _labelStyle);
@@ -283,14 +545,4 @@ public class GPUInstancingBenchmark : MonoBehaviour
         GUILayout.EndArea();
     }
 
-    // ── Editor gizmo ──────────────────────────────────────────────────────────
-#if UNITY_EDITOR
-    void OnDrawGizmosSelected()
-    {
-        if (!Application.isPlaying) return;
-        Gizmos.color = new Color(0f, 1f, 0.5f, 0.12f);
-        float size = gridSize * spacing;
-        Gizmos.DrawWireCube(transform.position, new Vector3(size, 0.02f, size));
-    }
-#endif
 }

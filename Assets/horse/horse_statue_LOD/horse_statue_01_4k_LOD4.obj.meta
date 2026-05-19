@@ -1,5 +1,5 @@
 fileFormatVersion: 2
-guid: 2e8a4281c0e1fc64281821c1fb76177a
+guid: cdbd9702a1a95ac48a580aa6d2093dcf
 ModelImporter:
   serializedVersion: 24200
   internalIDToNameTable: []
@@ -30,7 +30,7 @@ ModelImporter:
     extraExposedTransformPaths: []
     extraUserProperties: []
     clipAnimations: []
-    isReadable: 0
+    isReadable: 1
   meshes:
     lODScreenPercentages: []
     globalScale: 10
@@ -59,7 +59,7 @@ ModelImporter:
     generateMeshLods: 0
     meshLodGenerationFlags: 0
     maximumMeshLod: -1
-    meshOptimizationFlags: -1
+    meshOptimizationFlags: 0
     indexFormat: 0
     secondaryUVAngleDistortion: 8
     secondaryUVAreaDistortion: 15.000001
