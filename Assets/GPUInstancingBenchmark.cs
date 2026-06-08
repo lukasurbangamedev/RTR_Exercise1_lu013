@@ -154,6 +154,8 @@ public class GPUInstancingBenchmark : MonoBehaviour
             Texture2D tex = GenerateNoiseTexture(32, 32, i * 1337);
             mat.mainTexture = tex;
 
+            mat.enableInstancing = false;
+
             _materials10[i] = mat;
         }
 
@@ -182,6 +184,8 @@ public class GPUInstancingBenchmark : MonoBehaviour
                 mat.EnableKeyword("UNI_B");
 
             _perObjectMaterials[i] = mat;
+
+            mat.enableInstancing = false;
         }
     }
 

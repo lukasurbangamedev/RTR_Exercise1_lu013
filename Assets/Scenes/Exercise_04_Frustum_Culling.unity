@@ -483,7 +483,7 @@ MonoBehaviour:
   spacing: 1.5
   materialMode: 0
   useGPUInstancing: 0
-  useFrustumCulling: 0
+  useFrustumCulling: 1
   increaseKey: 273
   decreaseKey: 274
   toggleMatKey: 275
